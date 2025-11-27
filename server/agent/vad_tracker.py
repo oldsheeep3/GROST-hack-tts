@@ -19,10 +19,10 @@ TURN_END_SOFT_MS = 700      # 「そろそろ終わり」判定基準（短す�
 TURN_END_HARD_MS = 1200     # 「さすがに終わった」判定基準
 
 # Backchannel
-BC_MIN_SPEAK_MS = 800       # backchannelを検討し始めるまでの発話時間（短縮: 1500→800）
-BC_MIN_SIL_MS = 100         # 相槌に向いたポーズの下限（短縮: 200→100）
-BC_MAX_SIL_MS = 500         # 相槌に向いたポーズの上限（短縮: 700→500、応答開始と被らないように）
-BC_COOLDOWN_MS = 2500       # 相槌打った後のクールダウン（短縮: 3000→2500）
+BC_MIN_SPEAK_MS = 1000      # backchannelを検討し始めるまでの発話時間（1秒以上喋った後）
+BC_MIN_SIL_MS = 400         # 相槌に向いたポーズの下限（400ms以上の無音が必要）
+BC_MAX_SIL_MS = 800         # 相槌に向いたポーズの上限
+BC_COOLDOWN_MS = 3000       # 相槌打った後のクールダウン（3秒）
 
 # Hesitation
 HESITATION_MAX_MS = 600     # ためらいのポーズとして許容する無音
@@ -100,6 +100,7 @@ class VADFeatureTracker:
     # 連続区間の長さ（ms）
     speak_dur_ms: int = 0       # 連続発話時間
     silence_dur_ms: int = 0     # 連続無音時間
+    last_speak_dur_ms: int = 0  # 直前の発話時間（無音開始時に保存）
 
     # 絶対時間（monotonic ms）
     t_now_ms: int = 0
@@ -164,7 +165,8 @@ class VADFeatureTracker:
             self.t_last_voice_ms = t_now_ms
         else:
             if prev_vad:
-                # 無音開始
+                # 無音開始 → 直前の発話時間を保存
+                self.last_speak_dur_ms = self.speak_dur_ms
                 self.speak_dur_ms = 0
             self.silence_dur_ms += FRAME_HOP_MS
 
@@ -195,6 +197,7 @@ class VADFeatureTracker:
         self.vad_user = False
         self.speak_dur_ms = 0
         self.silence_dur_ms = 0
+        self.last_speak_dur_ms = 0
         self.t_last_voice_ms = None
         self.t_first_voice_ms = None
         self.energy_hist.clear()

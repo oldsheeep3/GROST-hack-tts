@@ -1,19 +1,14 @@
-"""Streaming STT Client - Deepgram WebSocket版
+"""Deepgram STT Service
 
-Deepgram WebSocket APIを使用したリアルタイムストリーミングASR。
-VADFeatureTrackerのUSER_START/USER_ENDと連携して動作。
-
-特徴:
-- interim_results=True で partial transcript を取得
-- punctuate=True で句読点を自動付与
-- speech_final/is_final フラグで発話終了を検出
-- VAD側で発話区間を管理し、その区間のみ音声を送信
+Deepgram WebSocket API を用いたリアルタイムストリーミング STT。
+PipecatSession から呼び出され、VAD が管理するユーザターン単位で
+音声を送信し partial/final テキストを通知する。
 """
 import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Callable, Any
+from typing import Any, Callable, List, Optional, Protocol, runtime_checkable
 
 import numpy as np
 import websockets
@@ -57,12 +52,38 @@ def build_deepgram_url(
     return f"{DEEPGRAM_WS_URL}?{'&'.join(params)}"
 
 
+@runtime_checkable
+class BaseSTTService(Protocol):
+    """STT サービスの共通インターフェース"""
+
+    on_speech_started: Optional[Callable[[], None]]
+    on_speech_final: Optional[Callable[[str], None]]
+
+    async def start(self) -> None:
+        ...
+
+    async def stop(self) -> None:
+        ...
+
+    def start_utterance(self) -> None:
+        ...
+
+    async def push_frame(self, pcm_frame, t_ms: int) -> None:
+        ...
+
+    async def get_all_partials(self) -> List[dict]:
+        ...
+
+    async def end_utterance(self, timeout_ms: int = 800) -> str:
+        ...
+
+
 @dataclass
-class StreamingSTTClient:
+class DeepgramSTTService:
     """Deepgram WebSocketストリーミングSTTクライアント
 
     Usage:
-        stt = StreamingSTTClient()
+        stt = DeepgramSTTService()
         await stt.start()
 
         # USER_START 時
@@ -99,6 +120,10 @@ class StreamingSTTClient:
     # 統計
     frames_sent: int = 0
     total_audio_ms: int = 0
+
+    # コールバック（イベントを外部に通知）
+    on_speech_started: Optional[Callable[[], None]] = field(default=None, repr=False)
+    on_speech_final: Optional[Callable[[str], None]] = field(default=None, repr=False)  # speech_final時にテキストを通知
 
     _initialized: bool = field(default=False, repr=False)
 
@@ -226,8 +251,11 @@ class StreamingSTTClient:
             request_id = data.get("request_id", "")
             print(f"[STT] Metadata: request_id={request_id}")
         elif msg_type == "SpeechStarted":
-            # VADが発話開始を検出
-            print(f"[STT] SpeechStarted")
+            # DeepgramのVADが発話開始を検出 → コールバックで外部に通知
+            print(f"[STT] SpeechStarted (utterance_active={self.utterance_active})")
+            if self.on_speech_started and not self.utterance_active:
+                # まだutteranceが開始されていない場合、外部に通知
+                self.on_speech_started()
         elif msg_type == "UtteranceEnd":
             # 発話終了（endpointing）
             print(f"[STT] UtteranceEnd")
@@ -236,20 +264,17 @@ class StreamingSTTClient:
             print(f"[STT] Error from Deepgram: {error}")
 
     async def _handle_results(self, data: dict):
-        """Results メッセージを処理"""
+        """Results メッセージを処理
+
+        ★ utterance_active チェックを廃止
+        DeepgramのVADに任せて、常に結果を処理する。
+        VADとSTTを並列で動かす設計。
+        """
         channel = data.get("channel", {})
         alternatives = channel.get("alternatives", [])
         transcript = alternatives[0].get("transcript", "") if alternatives else ""
 
-        # デバッグ: utterance_active状態とtranscriptを表示
-        print(f"[STT] _handle_results: utterance_active={self.utterance_active} transcript='{transcript[:50]}...' if len > 50")
-
-        if not self.utterance_active:
-            print(f"[STT] _handle_results: SKIP (utterance not active)")
-            return
-
         if not alternatives:
-            print(f"[STT] _handle_results: SKIP (no alternatives)")
             return
 
         confidence = alternatives[0].get("confidence", 0.0)
@@ -258,7 +283,6 @@ class StreamingSTTClient:
 
         # 空のトランスクリプトは無視
         if not transcript.strip():
-            print(f"[STT] _handle_results: SKIP (empty transcript)")
             return
 
         # ログ出力
@@ -268,7 +292,7 @@ class StreamingSTTClient:
         if speech_final:
             flags.append("speech_final")
         flag_str = f" [{', '.join(flags)}]" if flags else " [interim]"
-        print(f"[STT] Result: '{transcript}'{flag_str} (conf={confidence:.2f})")
+        print(f"[STT] '{transcript}'{flag_str}")
 
         # テキスト更新
         if is_final:
@@ -288,6 +312,15 @@ class StreamingSTTClient:
             "is_final": is_final,
             "speech_final": speech_final,
         })
+
+        # ★ speech_final でコールバックを呼ぶ（LLM起動トリガー）
+        if speech_final and self.on_speech_final and self.current_text.strip():
+            print(f"[STT] speech_final → calling on_speech_final callback with text='{self.current_text}'")
+            self.on_speech_final(self.current_text)
+
+        # ★ speech_final でのリセットは行わない
+        #    end_utterance() が呼ばれるまで current_text を保持する必要がある
+        #    リセットは start_utterance() で行う
 
     def _reset_utterance(self):
         """発話状態をリセット"""
@@ -425,8 +458,8 @@ class StreamingSTTClient:
         }
 
 
-async def test_streaming_stt_client():
-    """StreamingSTTClientのテスト"""
+async def test_deepgram_stt_service():
+    """DeepgramSTTService の簡易テスト"""
     import scipy.io.wavfile as wavfile
     import scipy.signal
     from server.config import OUTPUT_DIR
@@ -468,7 +501,7 @@ async def test_streaming_stt_client():
     print("-" * 60)
 
     # STTクライアント作成
-    client = StreamingSTTClient()
+    client = DeepgramSTTService()
     await client.start()
 
     try:
@@ -500,4 +533,4 @@ async def test_streaming_stt_client():
 
 
 if __name__ == "__main__":
-    asyncio.run(test_streaming_stt_client())
+    asyncio.run(test_deepgram_stt_service())

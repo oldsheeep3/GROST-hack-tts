@@ -1,7 +1,13 @@
 """Turn Manager
 
-VADFeatureTracker の出力 + STT状態 を見て、
-state遷移とイベント発火を行う層
+VADFeatureTracker の出力 + Deepgram入力 を見て、
+state遷移とイベント発火を行う **単一の状態管理層**
+
+★ 設計原則:
+- 状態はTurnManagerに一元化する（main.pyに分散させない）
+- VADとDeepgramの両方からの入力を受け付ける
+- エージェント発話状態も管理する
+- 割り込み判定もここで行う
 """
 import time
 from enum import Enum, auto
@@ -25,6 +31,10 @@ from server.agent.vad_tracker import (
 # ★ 短い発話も受け付けるために緩和（STTで内容判定する方がマシ）
 MIN_UTTER_MS = 60  # 60ms (3フレーム) 未満の VAD は無視
 
+# 割り込み判定の閾値
+INTERRUPT_PAUSE_MS = 200    # これ以上VAD検出が続いたら一時停止
+INTERRUPT_STOP_MS = 500     # これ以上VAD検出が続いたら完全停止
+
 
 # =============================================================================
 # イベント定義
@@ -37,6 +47,9 @@ class EventType(Enum):
     AGENT_START_FAST = auto()     # 前置き再生開始
     AGENT_START_MAIN = auto()     # 本編TTS開始（最初の文）
     AGENT_STOP_SPEAKING = auto()  # エージェント発話停止
+    AGENT_PAUSE = auto()          # エージェント一時停止（短い割り込み）
+    AGENT_RESUME = auto()         # エージェント再開
+    START_LLM = auto()            # LLM起動トリガー（speech_finalから）
 
 
 # =============================================================================
@@ -49,6 +62,7 @@ class ConvState(Enum):
     BACKCHANNEL_PENDING = auto()  # 相槌を打つことが決まった状態
     PLANNING_FAST = auto()        # ターン終端直後、前置き再生中
     SPEAKING_MAIN = auto()        # 本編TTS再生中
+    SPEAKING_PAUSED = auto()      # エージェント発話一時停止中
 
 
 # =============================================================================
@@ -56,7 +70,14 @@ class ConvState(Enum):
 # =============================================================================
 @dataclass
 class TurnManager:
-    """ターン管理ステートマシン"""
+    """ターン管理ステートマシン
+
+    ★ 全ての状態をここに一元化:
+    - 会話状態 (ConvState)
+    - エージェント発話状態
+    - 割り込み検出状態
+    - VAD/Deepgram からの入力処理
+    """
 
     # 現在の状態
     state: ConvState = ConvState.IDLE
@@ -80,6 +101,16 @@ class TurnManager:
     llm_started: bool = False
     t_llm_start_ms: Optional[int] = None
     t_first_audio_ready_ms: Optional[int] = None
+
+    # ★ エージェント発話状態（main.pyから移動）
+    is_agent_speaking: bool = False
+    playback_end_time_ms: float = 0  # 再生終了予想時刻
+
+    # ★ 割り込み検出状態（main.pyから移動）
+    interrupt_vad_start_ms: Optional[int] = None  # 割り込みVAD開始時刻
+
+    # ★ Deepgramからの入力を保持
+    pending_speech_final_text: Optional[str] = None  # speech_finalで受け取ったテキスト
 
     # 前回の状態（ログ用）
     _prev_state: ConvState = field(default=ConvState.IDLE, repr=False)
@@ -246,10 +277,24 @@ class TurnManager:
         """BACKCHANNEL_PENDING: 相槌を打つことが決まった状態"""
         ev = []
         tr = self.tracker
+        t = tr.t_now_ms
 
         # ユーザが急に喋り始めたら LISTENING に戻す
         if tr.vad_user:
             self.state = ConvState.LISTENING
+            return ev
+
+        # 相槌中でも無音が続けばTURN_END_HARD判定 → 本応答へ遷移
+        if self._is_turn_end_hard():
+            self.state = ConvState.PLANNING_FAST
+            self.t_user_end_hard_ms = t
+            ev.append((EventType.USER_END_HARD, {
+                "t": t,
+                "stt_final": self.stt_text,
+            }))
+            ev.append((EventType.AGENT_START_FAST, {
+                "t": t,
+            }))
             return ev
 
         # 相槌WAV が終わった時点で外から notify_backchannel_done() が呼ばれる想定
@@ -325,9 +370,9 @@ class TurnManager:
         if tr.silence_dur_ms == 0:
             return False
 
-        # 実際の発話時間（speak_dur_ms の累積）が一定以上続いた後でなければNG
-        # ※ total_user_speech = t - t_user_start_ms だとノイズでも時間だけ経過する問題があった
-        if tr.speak_dur_ms < BC_MIN_SPEAK_MS:
+        # 直前の発話時間（last_speak_dur_ms）が一定以上続いた後でなければNG
+        # ※ 無音中は speak_dur_ms=0 なので last_speak_dur_ms を使う
+        if tr.last_speak_dur_ms < BC_MIN_SPEAK_MS:
             return False
 
         # 無音時間が相槌に適した範囲かチェック
@@ -473,4 +518,204 @@ class TurnManager:
             "stt_text": self.stt_text[:30] + "..." if len(self.stt_text) > 30 else self.stt_text,
             "llm_started": self.llm_started,
             "energy_trend": tr.get_recent_energy_trend(),
+            "is_agent_speaking": self.is_agent_speaking,
         }
+
+    # =========================================================================
+    # Deepgram からの入力処理
+    # =========================================================================
+
+    def notify_deepgram_speech_started(self, t_now_ms: int) -> List[Tuple[EventType, Dict[str, Any]]]:
+        """DeepgramのSpeechStartedイベントを処理
+
+        VADより先にDeepgramが発話を検出した場合の処理。
+        エージェント発話中なら即座に割り込み処理を行う。
+
+        Returns:
+            発火したイベントのリスト
+        """
+        events: List[Tuple[EventType, Dict[str, Any]]] = []
+        self.tracker.t_now_ms = t_now_ms
+
+        print(f"[TurnManager] notify_deepgram_speech_started: state={self.state.name}, is_agent_speaking={self.is_agent_speaking}")
+
+        vad_evidence = self._has_user_vad_evidence()
+
+        # ★ エージェント発話中の場合は VAD裏付けがあるときのみ割り込み
+        if self.is_agent_speaking or self.state in (ConvState.PLANNING_FAST, ConvState.SPEAKING_MAIN, ConvState.SPEAKING_PAUSED):
+            if not vad_evidence:
+                print(f"[TurnManager] Deepgram SpeechStarted ignored (no VAD evidence during agent speech)")
+                return events
+            print(f"[TurnManager] Deepgram SpeechStarted during agent speaking → INTERRUPT")
+            events.append((EventType.AGENT_STOP_SPEAKING, {"reason": "deepgram_speech_started"}))
+            self._stop_agent_speaking()
+            # 新しいターンを開始
+            self._start_new_user_turn(t_now_ms)
+            events.append((EventType.USER_START, {"t": t_now_ms}))
+            return events
+
+        # ★ それ以外の状態では、ユーザ発話開始として処理
+        if self.state == ConvState.IDLE:
+            if not vad_evidence:
+                print(f"[TurnManager] Deepgram SpeechStarted ignored (idle, no VAD evidence)")
+                return events
+            self._start_new_user_turn(t_now_ms)
+            events.append((EventType.USER_START, {"t": t_now_ms}))
+        elif self.state in (ConvState.HESITATION_GAP, ConvState.BACKCHANNEL_PENDING):
+            if not vad_evidence:
+                print(f"[TurnManager] Deepgram SpeechStarted ignored (gap state, no VAD evidence)")
+                return events
+            # 短いポーズ中にDeepgramが検出 → LISTENINGに戻す
+            self.state = ConvState.LISTENING
+            print(f"[TurnManager] Deepgram detected speech during {self.state.name} → LISTENING")
+
+        return events
+
+    def notify_deepgram_speech_final(self, text: str, t_now_ms: int) -> List[Tuple[EventType, Dict[str, Any]]]:
+        """Deepgramのspeech_finalイベントを処理
+
+        VADに関係なく、Deepgramが発話終了を検出したらLLM起動をトリガー。
+
+        Returns:
+            発火したイベントのリスト
+        """
+        events: List[Tuple[EventType, Dict[str, Any]]] = []
+        self.tracker.t_now_ms = t_now_ms
+
+        print(f"[TurnManager] notify_deepgram_speech_final: text='{text}', state={self.state.name}, llm_started={self.llm_started}")
+
+        if not text.strip():
+            print(f"[TurnManager] speech_final ignored: empty text")
+            return events
+
+        # LLMが既に起動している場合は無視
+        if self.llm_started:
+            print(f"[TurnManager] speech_final ignored: LLM already started")
+            return events
+
+        # エージェント発話中は無視（割り込みはspeech_startedで処理済み）
+        if self.is_agent_speaking:
+            print(f"[TurnManager] speech_final ignored: agent is speaking")
+            return events
+
+        # ★ LLM起動イベントを発火
+        self.pending_speech_final_text = text
+        self.stt_text = text  # STTテキストも更新
+        events.append((EventType.START_LLM, {"text": text, "t": t_now_ms}))
+        print(f"[TurnManager] speech_final → START_LLM event")
+
+        return events
+
+    # =========================================================================
+    # エージェント発話状態管理
+    # =========================================================================
+
+    def notify_agent_start_speaking(self, duration_ms: int, t_now_ms: int) -> None:
+        """エージェント発話開始を通知
+
+        Args:
+            duration_ms: 再生予定時間（ms）
+            t_now_ms: 現在時刻（ms）
+        """
+        self.is_agent_speaking = True
+        self.playback_end_time_ms = t_now_ms + duration_ms + 100  # 100msのバッファ
+        self.tracker.t_now_ms = t_now_ms
+        print(f"[TurnManager] Agent started speaking, duration={duration_ms}ms, end_time={self.playback_end_time_ms}")
+
+    def notify_agent_done_speaking(self, t_now_ms: int) -> None:
+        """エージェント発話完了を通知"""
+        self._stop_agent_speaking()
+        self.tracker.t_now_ms = t_now_ms
+        # IDLEに戻す
+        if self.state in (ConvState.SPEAKING_MAIN, ConvState.SPEAKING_PAUSED, ConvState.PLANNING_FAST):
+            self.state = ConvState.IDLE
+        print(f"[TurnManager] Agent done speaking, state → {self.state.name}")
+
+    def _stop_agent_speaking(self) -> None:
+        """エージェント発話状態をクリア（内部用）"""
+        self.is_agent_speaking = False
+        self.playback_end_time_ms = 0
+        self.interrupt_vad_start_ms = None
+
+    def _start_new_user_turn(self, t_now_ms: int) -> None:
+        """新しいユーザターンを開始（内部用）"""
+        self.state = ConvState.LISTENING
+        self.t_user_start_ms = t_now_ms
+        self.t_user_end_soft_ms = None
+        self.t_user_end_hard_ms = None
+        self.stt_text = ""
+        self.stt_first_partial_time_ms = None
+        self.llm_started = False
+        self.t_llm_start_ms = None
+        self.pending_speech_final_text = None
+        print(f"[TurnManager] New user turn started at {t_now_ms}ms")
+
+    def _has_user_vad_evidence(self) -> bool:
+        """Deepgramイベントを信用して良いだけのVAD裏付けがあるか"""
+        tr = self.tracker
+        if tr.vad_user:
+            return True
+        if tr.speak_dur_ms >= MIN_UTTER_MS:
+            return True
+        if tr.last_speak_dur_ms >= MIN_UTTER_MS and tr.silence_dur_ms <= HESITATION_MAX_MS:
+            return True
+        return False
+
+    # =========================================================================
+    # 割り込み処理（VADベース）
+    # =========================================================================
+
+    def check_vad_interrupt(self, t_now_ms: int) -> List[Tuple[EventType, Dict[str, Any]]]:
+        """VADベースの割り込み判定
+
+        エージェント発話中にVADがアクティブな場合、
+        時間経過に応じて一時停止→完全停止を判定する。
+
+        Returns:
+            発火したイベントのリスト
+        """
+        events: List[Tuple[EventType, Dict[str, Any]]] = []
+        tr = self.tracker
+
+        # エージェントが発話していない場合は何もしない
+        if not self.is_agent_speaking and self.state not in (ConvState.PLANNING_FAST, ConvState.SPEAKING_MAIN, ConvState.SPEAKING_PAUSED):
+            return events
+
+        if tr.vad_user:
+            # VAD検出開始時刻を記録
+            if self.interrupt_vad_start_ms is None:
+                self.interrupt_vad_start_ms = t_now_ms
+                print(f"[TurnManager] VAD interrupt detection started at {t_now_ms}ms")
+
+            vad_duration_ms = t_now_ms - self.interrupt_vad_start_ms
+
+            # ★ 200ms以上で一時停止
+            if vad_duration_ms >= INTERRUPT_PAUSE_MS and self.state != ConvState.SPEAKING_PAUSED:
+                self.state = ConvState.SPEAKING_PAUSED
+                events.append((EventType.AGENT_PAUSE, {"t": t_now_ms, "vad_duration_ms": vad_duration_ms}))
+                print(f"[TurnManager] VAD {vad_duration_ms}ms → AGENT_PAUSE")
+
+            # ★ 500ms以上で完全停止
+            if vad_duration_ms >= INTERRUPT_STOP_MS:
+                events.append((EventType.AGENT_STOP_SPEAKING, {"reason": "vad_interrupt", "vad_duration_ms": vad_duration_ms}))
+                self._stop_agent_speaking()
+                self._start_new_user_turn(t_now_ms)
+                events.append((EventType.USER_START, {"t": t_now_ms}))
+                print(f"[TurnManager] VAD {vad_duration_ms}ms → AGENT_STOP_SPEAKING + USER_START")
+
+        else:
+            # VADが非アクティブになった
+            if self.interrupt_vad_start_ms is not None:
+                vad_duration_ms = t_now_ms - self.interrupt_vad_start_ms
+                self.interrupt_vad_start_ms = None
+
+                if vad_duration_ms < INTERRUPT_PAUSE_MS:
+                    # ★ 200ms未満: 相槌として無視
+                    print(f"[TurnManager] VAD ended ({vad_duration_ms}ms) → short backchannel, ignored")
+                elif self.state == ConvState.SPEAKING_PAUSED:
+                    # ★ 一時停止中なら再開
+                    self.state = ConvState.SPEAKING_MAIN
+                    events.append((EventType.AGENT_RESUME, {"t": t_now_ms}))
+                    print(f"[TurnManager] VAD ended ({vad_duration_ms}ms) → AGENT_RESUME")
+
+        return events

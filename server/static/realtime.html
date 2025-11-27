@@ -494,21 +494,24 @@
           log(`[${t}ms] LLM_END (reason: ${msg.reason || 'normal'})`);
           break;
 
+        case 'agent_pause':
         case 'agent_paused':
           pausePlayback();
           log(`[${t}ms] AGENT_PAUSED (VAD detected)`);
           break;
 
+        case 'agent_resume':
         case 'agent_resumed':
           resumePlayback();
           log(`[${t}ms] AGENT_RESUMED (backchannel detected)`);
           break;
 
+        case 'agent_stop_speaking':
         case 'agent_interrupted':
           stopPlayback();
           setStatus('listening', 'Listening...');
           metricState.textContent = 'LISTENING';
-          log(`[${t}ms] AGENT_INTERRUPTED`);
+          log(`[${t}ms] AGENT_INTERRUPTED (reason: ${msg.reason || 'unknown'})`);
           break;
 
         case 'backchannel':
