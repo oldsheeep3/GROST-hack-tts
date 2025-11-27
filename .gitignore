@@ -1,0 +1,6 @@
+.env
+
+.venv/
+docs/
+output/
+models/

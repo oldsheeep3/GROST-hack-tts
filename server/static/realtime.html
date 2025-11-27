@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Realtime Voice Agent</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; margin-bottom: 10px; }
+    .status {
+      padding: 10px 15px;
+      border-radius: 8px;
+      margin: 10px 0;
+      font-weight: bold;
+    }
+    .status.disconnected { background: #c0392b; }
+    .status.connected { background: #27ae60; }
+    .status.listening { background: #2980b9; }
+    .status.speaking { background: #8e44ad; }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin: 20px 0;
+    }
+    button {
+      padding: 15px 30px;
+      font-size: 18px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    button:hover { transform: scale(1.05); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    #startBtn { background: #27ae60; color: white; }
+    #stopBtn { background: #c0392b; color: white; }
+
+    .panel {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 15px 0;
+    }
+    .panel h3 {
+      margin: 0 0 10px 0;
+      color: #00d9ff;
+      font-size: 14px;
+      text-transform: uppercase;
+    }
+    #sttText {
+      font-size: 18px;
+      min-height: 50px;
+      color: #fff;
+    }
+    #agentText {
+      font-size: 18px;
+      min-height: 50px;
+      color: #00d9ff;
+    }
+
+    #log {
+      font-family: 'Monaco', 'Consolas', monospace;
+      font-size: 12px;
+      background: #0f0f23;
+      color: #0f0;
+      padding: 10px;
+      border-radius: 8px;
+      max-height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    .metric {
+      background: #0f3460;
+      padding: 10px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .metric .value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #00d9ff;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: #888;
+    }
+
+    .visualizer {
+      height: 60px;
+      background: #0f0f23;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .visualizer canvas {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <h1>Realtime Voice Agent</h1>
+
+  <div id="statusBar" class="status disconnected">Disconnected</div>
+
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <div class="panel">
+    <h3>Input Visualizer</h3>
+    <div class="visualizer">
+      <canvas id="visualizer"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>You (STT)</h3>
+    <div id="sttText">-</div>
+  </div>
+
+  <div class="panel">
+    <h3>Agent</h3>
+    <div id="agentText">-</div>
+  </div>
+
+  <div class="panel">
+    <h3>Metrics</h3>
+    <div class="metrics">
+      <div class="metric">
+        <div class="value" id="metricLatency">-</div>
+        <div class="label">Response Latency (ms)</div>
+      </div>
+      <div class="metric">
+        <div class="value" id="metricFrames">0</div>
+        <div class="label">Frames Sent</div>
+      </div>
+      <div class="metric">
+        <div class="value" id="metricState">IDLE</div>
+        <div class="label">State</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Event Log</h3>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    // ===========================================
+    // DOM Elements
+    // ===========================================
+    const statusBar = document.getElementById('statusBar');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const sttText = document.getElementById('sttText');
+    const agentText = document.getElementById('agentText');
+    const logEl = document.getElementById('log');
+    const metricLatency = document.getElementById('metricLatency');
+    const metricFrames = document.getElementById('metricFrames');
+    const metricState = document.getElementById('metricState');
+    const visualizerCanvas = document.getElementById('visualizer');
+    const visualizerCtx = visualizerCanvas.getContext('2d');
+
+    // ===========================================
+    // State
+    // ===========================================
+    let ws = null;
+    let audioContext = null;       // 入力用 (16kHz)
+    let playbackContext = null;    // 再生用 (44.1kHz)
+    let mediaStream = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let playbackCursor = 0;  // AudioContext時間上の再生カーソル
+    let ttsSampleRate = 44100;  // サーバから受け取るサンプルレート
+    let framesSent = 0;
+    let userEndHardTime = null;
+    let firstAudioTime = null;
+
+    // ===========================================
+    // Logging
+    // ===========================================
+    function log(msg) {
+      const time = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+      const line = `[${time}] ${msg}\n`;
+      logEl.textContent += line;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    function setStatus(status, text) {
+      statusBar.className = `status ${status}`;
+      statusBar.textContent = text;
+    }
+
+    // ===========================================
+    // Audio Helpers
+    // ===========================================
+    function floatTo16BitPCM(float32Array) {
+      const buffer = new ArrayBuffer(float32Array.length * 2);
+      const view = new DataView(buffer);
+      for (let i = 0; i < float32Array.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return buffer;
+    }
+
+    function int16ToFloat32(int16Array) {
+      const float32Array = new Float32Array(int16Array.length);
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768.0;
+      }
+      return float32Array;
+    }
+
+    // 44.1k/48k → 16k ダウンサンプリング（STT用）
+    function downsampleTo16k(float32, inputSampleRate) {
+      const targetRate = 16000;
+      const ratio = inputSampleRate / targetRate;
+      const dstLength = Math.floor(float32.length / ratio);
+      const result = new Float32Array(dstLength);
+      for (let i = 0; i < dstLength; i++) {
+        result[i] = float32[Math.floor(i * ratio)];
+      }
+      return result;
+    }
+
+    // ===========================================
+    // Visualizer
+    // ===========================================
+    function drawVisualizer(dataArray) {
+      const width = visualizerCanvas.width;
+      const height = visualizerCanvas.height;
+
+      visualizerCtx.fillStyle = '#0f0f23';
+      visualizerCtx.fillRect(0, 0, width, height);
+
+      visualizerCtx.lineWidth = 2;
+      visualizerCtx.strokeStyle = '#00d9ff';
+      visualizerCtx.beginPath();
+
+      const sliceWidth = width / dataArray.length;
+      let x = 0;
+
+      for (let i = 0; i < dataArray.length; i++) {
+        const v = (dataArray[i] + 32768) / 65536;
+        const y = v * height;
+
+        if (i === 0) {
+          visualizerCtx.moveTo(x, y);
+        } else {
+          visualizerCtx.lineTo(x, y);
+        }
+        x += sliceWidth;
+      }
+
+      visualizerCtx.stroke();
+    }
+
+    // ===========================================
+    // Playback（時間指定スケジューリング方式）
+    // ===========================================
+    let activeSources = [];  // アクティブな AudioBufferSourceNode を追跡
+    let isPaused = false;    // 一時停止フラグ
+    let pausedAt = 0;        // 一時停止した時刻
+
+    function playAudioBuffer(int16Array) {
+      if (!playbackContext) return;
+      // 一時停止中は新しい音声をバッファに追加しつつ、再生はしない
+      // （AudioContextがsuspendされているので自動的に保留される）
+
+      const float32 = int16ToFloat32(int16Array);
+      const audioBuffer = playbackContext.createBuffer(1, float32.length, ttsSampleRate);
+      audioBuffer.getChannelData(0).set(float32);
+
+      const source = playbackContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(playbackContext.destination);
+
+      const now = playbackContext.currentTime;
+      if (playbackCursor < now) {
+        playbackCursor = now;
+      }
+
+      // カーソル位置に予約再生
+      source.start(playbackCursor);
+      // 文間に自然なポーズを追加（150ms）
+      const SENTENCE_GAP_SEC = 0.15;
+      playbackCursor += audioBuffer.duration + SENTENCE_GAP_SEC;
+
+      // ソースを追跡（停止用）
+      activeSources.push(source);
+      source.onended = () => {
+        const idx = activeSources.indexOf(source);
+        if (idx > -1) activeSources.splice(idx, 1);
+      };
+
+      log(`Audio scheduled: ${float32.length} samples @ ${ttsSampleRate}Hz, duration=${audioBuffer.duration.toFixed(3)}s`);
+    }
+
+    function pausePlayback() {
+      // AudioContextをサスペンドして一時停止
+      if (playbackContext && playbackContext.state === 'running') {
+        pausedAt = playbackContext.currentTime;
+        playbackContext.suspend();
+        isPaused = true;
+        log('Playback paused');
+      }
+    }
+
+    function resumePlayback() {
+      // AudioContextを再開
+      if (playbackContext && playbackContext.state === 'suspended' && isPaused) {
+        playbackContext.resume();
+        isPaused = false;
+        log('Playback resumed');
+      }
+    }
+
+    function stopPlayback() {
+      // 全てのアクティブな音声を停止
+      for (const source of activeSources) {
+        try {
+          source.stop();
+        } catch (e) {
+          // 既に停止している場合は無視
+        }
+      }
+      activeSources = [];
+      playbackCursor = 0;
+      isPaused = false;
+      // サスペンド状態なら再開（新しい音声を受け入れられるように）
+      if (playbackContext && playbackContext.state === 'suspended') {
+        playbackContext.resume();
+      }
+      log('Playback stopped');
+    }
+
+    // Backchannel専用再生（メインキューとは独立）
+    function playBackchannelAudio(base64Audio, sampleRate) {
+      if (!playbackContext) return;
+
+      // Base64をデコード
+      const binaryStr = atob(base64Audio);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+      const int16Array = new Int16Array(bytes.buffer);
+
+      // Float32に変換
+      const float32 = int16ToFloat32(int16Array);
+      const audioBuffer = playbackContext.createBuffer(1, float32.length, sampleRate);
+      audioBuffer.getChannelData(0).set(float32);
+
+      const source = playbackContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(playbackContext.destination);
+
+      // 即座に再生（メインキューのカーソルとは無関係）
+      source.start(0);
+
+      log(`Backchannel playing: ${float32.length} samples @ ${sampleRate}Hz`);
+    }
+
+    // ===========================================
+    // WebSocket
+    // ===========================================
+    function connectWebSocket() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${location.host}/ws/realtime`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        log('WebSocket connected');
+        setStatus('connected', 'Connected');
+        ws.send(JSON.stringify({ type: 'config', sampleRate: 16000 }));
+      };
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          // Text message (event)
+          try {
+            const msg = JSON.parse(event.data);
+            handleEvent(msg);
+          } catch (e) {
+            log(`Parse error: ${e}`);
+          }
+        } else {
+          // Binary message (audio)
+          const int16 = new Int16Array(event.data);
+
+          // Record first audio time for latency calculation
+          if (firstAudioTime === null && userEndHardTime !== null) {
+            firstAudioTime = performance.now();
+            const latency = Math.round(firstAudioTime - userEndHardTime);
+            metricLatency.textContent = latency;
+            log(`First audio latency: ${latency}ms`);
+          }
+
+          // 時間指定スケジューリングで再生
+          playAudioBuffer(int16);
+        }
+      };
+
+      ws.onclose = () => {
+        log('WebSocket closed');
+        setStatus('disconnected', 'Disconnected');
+      };
+
+      ws.onerror = (e) => {
+        log(`WebSocket error: ${e}`);
+      };
+    }
+
+    function handleEvent(msg) {
+      const { name, t } = msg;
+
+      switch (name) {
+        case 'session_start':
+          log(`Session started (sample_rate: ${msg.sample_rate})`);
+          break;
+
+        case 'stt_partial':
+          sttText.textContent = msg.text || '-';
+          break;
+
+        case 'user_start':
+          setStatus('listening', 'Listening...');
+          metricState.textContent = 'LISTENING';
+          userEndHardTime = null;
+          firstAudioTime = null;
+          log(`[${t}ms] USER_START`);
+          break;
+
+        case 'user_end_soft':
+          log(`[${t}ms] USER_END_SOFT`);
+          break;
+
+        case 'user_end_hard':
+          userEndHardTime = performance.now();
+          metricState.textContent = 'PROCESSING';
+          log(`[${t}ms] USER_END_HARD`);
+          break;
+
+        case 'llm_start':
+        case 'llm_start_early':
+          setStatus('speaking', 'Agent Speaking...');
+          metricState.textContent = 'SPEAKING';
+          agentText.textContent = '';
+          log(`[${t}ms] ${name.toUpperCase()}: "${msg.user_text}"`);
+          break;
+
+        case 'tts_start':
+          agentText.textContent += msg.text;
+          log(`[${t}ms] TTS: "${msg.text}"`);
+          break;
+
+        case 'tts_done':
+          // サーバからサンプルレートを受け取る
+          if (msg.sample_rate) {
+            ttsSampleRate = msg.sample_rate;
+            log(`TTS sample rate: ${ttsSampleRate}Hz`);
+          }
+          break;
+
+        case 'llm_end':
+          setStatus('connected', 'Connected');
+          metricState.textContent = 'IDLE';
+          // ★ llm_end受信時にplaybackCursorをリセット（ハング防止）
+          // これにより次の再生が即座に開始可能になる
+          playbackCursor = 0;
+          log(`[${t}ms] LLM_END (reason: ${msg.reason || 'normal'})`);
+          break;
+
+        case 'agent_paused':
+          pausePlayback();
+          log(`[${t}ms] AGENT_PAUSED (VAD detected)`);
+          break;
+
+        case 'agent_resumed':
+          resumePlayback();
+          log(`[${t}ms] AGENT_RESUMED (backchannel detected)`);
+          break;
+
+        case 'agent_interrupted':
+          stopPlayback();
+          setStatus('listening', 'Listening...');
+          metricState.textContent = 'LISTENING';
+          log(`[${t}ms] AGENT_INTERRUPTED`);
+          break;
+
+        case 'backchannel':
+          // 相槌イベント：Base64音声データを即座に再生（メインキューとは独立）
+          if (msg.audio && msg.sample_rate) {
+            playBackchannelAudio(msg.audio, msg.sample_rate);
+          }
+          log(`[${t}ms] BACKCHANNEL: "${msg.text}"`);
+          break;
+
+        case 'error':
+          log(`ERROR: ${msg.message}`);
+          break;
+
+        default:
+          log(`[${t}ms] ${name}`);
+      }
+    }
+
+    // ===========================================
+    // Start/Stop
+    // ===========================================
+    async function start() {
+      try {
+        // Audio Context for input (OS default: 44.1k or 48k)
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        log(`Input AudioContext sampleRate: ${audioContext.sampleRate}`);
+
+        // Audio Context for playback (44.1kHz for TTS)
+        playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+        log(`Playback AudioContext sampleRate: ${playbackContext.sampleRate}`);
+
+        // Get microphone
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true
+          },
+          video: false
+        });
+
+        sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+        // ScriptProcessor for capturing audio
+        // Buffer size 1024 @ 48k → downsample to 16k → ~341 samples ≈ 21ms
+        // Buffer size 1024 @ 44.1k → downsample to 16k → ~371 samples ≈ 23ms
+        // Close to server's expected 320 samples (20ms @ 16kHz)
+        processorNode = audioContext.createScriptProcessor(1024, 1, 1);
+
+        processorNode.onaudioprocess = (e) => {
+          const inputData = e.inputBuffer.getChannelData(0);
+          const inputSampleRate = audioContext.sampleRate;
+
+          // Downsample to 16k for STT
+          const downsampled = downsampleTo16k(inputData, inputSampleRate);
+
+          // Visualize (using downsampled data)
+          const int16ForVis = new Int16Array(downsampled.length);
+          for (let i = 0; i < downsampled.length; i++) {
+            int16ForVis[i] = Math.max(-32768, Math.min(32767, downsampled[i] * 32768));
+          }
+          drawVisualizer(int16ForVis);
+
+          // Send 16k PCM to server
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const pcm = floatTo16BitPCM(downsampled);
+            ws.send(pcm);
+            framesSent++;
+            metricFrames.textContent = framesSent;
+          }
+        };
+
+        sourceNode.connect(processorNode);
+        // Connect to a silent gain node (required for ScriptProcessor to work)
+        // but with gain=0 to prevent mic feedback
+        const silentGain = audioContext.createGain();
+        silentGain.gain.value = 0;
+        processorNode.connect(silentGain);
+        silentGain.connect(audioContext.destination);
+
+        // Connect WebSocket
+        connectWebSocket();
+
+        // Update UI
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        framesSent = 0;
+        playbackQueue = [];
+
+        // Resize canvas
+        visualizerCanvas.width = visualizerCanvas.offsetWidth;
+        visualizerCanvas.height = visualizerCanvas.offsetHeight;
+
+        log('Started');
+
+      } catch (e) {
+        log(`Start error: ${e}`);
+        setStatus('disconnected', 'Error: ' + e.message);
+      }
+    }
+
+    function stop() {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+
+      if (processorNode) {
+        processorNode.disconnect();
+        processorNode = null;
+      }
+
+      if (sourceNode) {
+        sourceNode.disconnect();
+        sourceNode = null;
+      }
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+
+      if (playbackContext) {
+        // 再生中の音声を停止
+        stopPlayback();
+        playbackContext.close();
+        playbackContext = null;
+      }
+
+      playbackCursor = 0;
+      activeSources = [];
+
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      setStatus('disconnected', 'Disconnected');
+
+      log('Stopped');
+    }
+
+    // ===========================================
+    // Event Listeners
+    // ===========================================
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+
+    // Handle page unload
+    window.addEventListener('beforeunload', stop);
+  </script>
+</body>
+</html>
