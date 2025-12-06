@@ -73,16 +73,26 @@ async def broadcast_audio(audio: bytes):
 
 
 class TextToSpeechSession:
-    """WebSocket session for text-to-speech with ordered async queue"""
+    """WebSocket session for text-to-speech with single LLM and multiple TTS workers"""
 
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self.llm: Optional[LLMService] = None
         self.tts: Optional[TTSService] = None
         self.t_start_ms: Optional[float] = None
-        self.text_queue: asyncio.Queue = asyncio.Queue()  # テキスト入力キュー
-        self.queue_processor_task: Optional[asyncio.Task] = None  # キュー処理タスク
+        
+        # 入力キュー（ユーザーのテキスト入力）
+        self.text_input_queue: asyncio.Queue = asyncio.Queue()
+        
+        # 中間キュー（LLMが生成した文章）
+        self.generated_text_queue: asyncio.Queue = asyncio.Queue()
+        
+        # ワーカータスク
+        self.llm_task: Optional[asyncio.Task] = None  # LLM は単一
+        self.tts_workers: list[asyncio.Task] = []     # TTS は複数
+        
         self.initialized = False
+        self.num_tts_workers = 3   # TTS 並列度（音声生成を複数並列）
 
     async def start(self):
         """セッション開始"""
@@ -96,11 +106,20 @@ class TextToSpeechSession:
             self.t_start_ms = time.perf_counter() * 1000
             self.initialized = True
             
-            # キュー処理タスクを開始
-            self.queue_processor_task = asyncio.create_task(self._process_queue())
+            # LLM は単一で実行（入力キューから順番に処理）
+            self.llm_task = asyncio.create_task(self._llm_processor())
             
-            print("[Session] All services initialized")
-            await self.send_event("session_start", {"status": "ready", "sample_rate": 44100})
+            # TTS ワーカーを複数起動（並列で音声生成）
+            for i in range(self.num_tts_workers):
+                worker_task = asyncio.create_task(self._tts_worker(i))
+                self.tts_workers.append(worker_task)
+            
+            print(f"[Session] All services initialized: 1 LLM + {self.num_tts_workers} TTS workers")
+            await self.send_event("session_start", {
+                "status": "ready",
+                "sample_rate": 44100,
+                "tts_workers": self.num_tts_workers
+            })
         except Exception as e:
             print(f"[Session] Init error: {e}")
             import traceback
@@ -109,9 +128,14 @@ class TextToSpeechSession:
 
     async def stop(self):
         """セッション終了"""
-        # キュー処理タスクをキャンセル
-        if self.queue_processor_task and not self.queue_processor_task.done():
-            self.queue_processor_task.cancel()
+        # LLM タスクをキャンセル
+        if self.llm_task and not self.llm_task.done():
+            self.llm_task.cancel()
+        
+        # すべての TTS ワーカータスクをキャンセル
+        for worker_task in self.tts_workers:
+            if worker_task and not worker_task.done():
+                worker_task.cancel()
         
         # LLMをキャンセル
         if self.llm:
@@ -133,94 +157,110 @@ class TextToSpeechSession:
         await broadcast_audio(np_int16_to_bytes(audio))
 
     async def handle_text_message(self, text: str):
-        """テキストメッセージをキューに追加"""
+        """テキストメッセージを入力キューに追加"""
         if not self.initialized:
             return
 
         if not text or not text.strip():
             return
 
-        print(f"[Queue] Adding text: '{text}'")
-        await self.send_event("text_queued", {"text": text, "queue_size": self.text_queue.qsize() + 1})
+        print(f"[Input] Adding text: '{text[:50]}...'")
+        queue_size = self.text_input_queue.qsize() + 1
+        await self.send_event("text_queued", {"text": text, "queue_size": queue_size})
         
-        # テキストをキューに追加（非同期）
-        await self.text_queue.put(text)
+        # テキストを入力キューに追加（非同期）
+        await self.text_input_queue.put(text)
 
-    async def _process_queue(self):
-        """キューからテキストを取り出して順に処理"""
-        print("[Queue] Processor started")
+    async def _llm_processor(self):
+        """LLM プロセッサ：テキストを順番に処理して文を生成
+        
+        LLM は単一で動作し、入力キューから順番にテキストを処理。
+        生成した文を即座に中間キューに追加（TTS ワーカーが並列処理）
+        """
+        print("[LLM] Processor started (single threaded)")
         try:
             while True:
-                # キューが空になるまで待機
-                text = await self.text_queue.get()
-                print(f"[Queue] Processing: '{text}' (remaining: {self.text_queue.qsize()})")
-                
+                # 入力キューからテキストを取得（FIFO）
+                user_text = await self.text_input_queue.get()
                 try:
-                    await self.run_llm_tts(text)
+                    print(f"[LLM] Processing text: '{user_text[:50]}...'")
+                    await self.send_event("llm_start", {"user_text": user_text})
+                    
+                    # LLM で文章を生成（ストリーミング）
+                    segmenter = SentenceSegmenter()
+                    sentence_count = 0
+                    
+                    async for delta in self.llm.generate_stream_async(user_text):
+                        for sentence in segmenter.push(delta):
+                            sentence_count += 1
+                            # 生成された文を即座に TTS キューに追加
+                            await self.generated_text_queue.put(sentence)
+                            print(f"[LLM] Sentence {sentence_count}: '{sentence[:50]}...'")
+                    
+                    # 最後の文を取得
+                    for sentence in segmenter.flush_last():
+                        sentence_count += 1
+                        await self.generated_text_queue.put(sentence)
+                        print(f"[LLM] Sentence {sentence_count}: '{sentence[:50]}...'")
+                    
+                    print(f"[LLM] Completed: generated {sentence_count} sentences")
+                    await self.send_event("llm_end", {"sentences": sentence_count})
+                    
                 except Exception as e:
-                    print(f"[Queue] Processing error: {e}")
-                    await self.send_event("error", {"message": f"Processing failed: {e}"})
+                    print(f"[LLM] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await self.send_event("error", {"message": f"LLM error: {e}"})
                 finally:
-                    self.text_queue.task_done()
+                    self.text_input_queue.task_done()
                     
         except asyncio.CancelledError:
-            print("[Queue] Processor cancelled")
+            print("[LLM] Processor cancelled")
         except Exception as e:
-            print(f"[Queue] Processor error: {e}")
+            print(f"[LLM] Unexpected error: {e}")
             import traceback
             traceback.print_exc()
 
-    async def run_llm_tts(self, user_text: str):
-        """LLMストリーミング + 文単位TTS → WebSocket送信"""
-        print(f"[LLM+TTS] Starting with: '{user_text}'")
-        await self.send_event("llm_start", {"user_text": user_text})
-
-        segmenter = SentenceSegmenter()
-        was_cancelled = False
-
+    async def _tts_worker(self, worker_id: int):
+        """TTS ワーカー：文章を受け取って音声を生成・送信"""
+        print(f"[TTS-Worker-{worker_id}] Started")
         try:
-            async for delta in self.llm.generate_stream_async(user_text):
-                for sentence in segmenter.push(delta):
-                    await self.synthesize_and_send(sentence)
-
-            for sentence in segmenter.flush_last():
-                await self.synthesize_and_send(sentence)
-
+            while True:
+                # 生成キューから文を取得
+                sentence = await self.generated_text_queue.get()
+                try:
+                    print(f"[TTS-Worker-{worker_id}] Synthesizing: '{sentence[:50]}...'")
+                    await self.send_event("tts_start", {"text": sentence})
+                    
+                    # TTS で音声を生成
+                    loop = asyncio.get_event_loop()
+                    sr, audio = await loop.run_in_executor(
+                        None, lambda: self.tts.synthesize(sentence)
+                    )
+                    
+                    duration_ms = len(audio) * 1000 // sr
+                    print(f"[TTS-Worker-{worker_id}] Done: {len(audio)} samples @ {sr}Hz, {duration_ms}ms")
+                    await self.send_event("tts_done", {
+                        "text": sentence,
+                        "duration_ms": duration_ms,
+                        "sample_rate": sr
+                    })
+                    
+                    # 音声をすべてのクライアントにブロードキャスト
+                    await self.send_audio(audio)
+                    
+                except Exception as e:
+                    print(f"[TTS-Worker-{worker_id}] Error: {e}")
+                    await self.send_event("error", {"message": f"TTS Worker-{worker_id}: {e}"})
+                finally:
+                    self.generated_text_queue.task_done()
+                    
         except asyncio.CancelledError:
-            was_cancelled = True
-            print(f"[LLM+TTS] Cancelled")
+            print(f"[TTS-Worker-{worker_id}] Cancelled")
         except Exception as e:
-            print(f"[LLM+TTS] Error: {e}")
+            print(f"[TTS-Worker-{worker_id}] Unexpected error: {e}")
             import traceback
             traceback.print_exc()
-            await self.send_event("error", {"message": str(e)})
-        finally:
-            print(f"[LLM+TTS] Cleanup")
-            if was_cancelled:
-                await self.send_event("llm_end", {"reason": "cancelled"})
-            else:
-                await self.send_event("llm_end")
-
-    async def synthesize_and_send(self, sentence: str):
-        """1文をTTS合成してWebSocket送信"""
-        print(f"[TTS] Synthesizing: '{sentence}'")
-        await self.send_event("tts_start", {"text": sentence})
-
-        loop = asyncio.get_event_loop()
-        sr, audio = await loop.run_in_executor(
-            None, lambda: self.tts.synthesize(sentence)
-        )
-
-        duration_ms = len(audio) * 1000 // sr
-        print(f"[TTS] Done: {len(audio)} samples @ {sr}Hz, {len(audio)/sr:.2f}s")
-        await self.send_event("tts_done", {
-            "text": sentence,
-            "duration_ms": duration_ms,
-            "sample_rate": sr
-        })
-
-        await self.send_audio(audio)
-        print(f"[TTS] Sent audio: {len(audio)} samples")
 
 
 @app.websocket("/ws/tts")
