@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Text-to-Speech Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; margin-bottom: 10px; }
+    .status {
+      padding: 10px 15px;
+      border-radius: 8px;
+      margin: 10px 0;
+      font-weight: bold;
+    }
+    .status.disconnected { background: #c0392b; }
+    .status.connected { background: #27ae60; }
+    .status.processing { background: #2980b9; }
+    .status.speaking { background: #8e44ad; }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin: 20px 0;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 12px 24px;
+      font-size: 16px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    button:hover { transform: scale(1.05); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    #connectBtn { background: #27ae60; color: white; }
+    #disconnectBtn { background: #c0392b; color: white; }
+    #sendBtn { background: #2980b9; color: white; }
+    #cancelBtn { background: #e67e22; color: white; }
+
+    .panel {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 15px 0;
+    }
+    .panel h3 {
+      margin: 0 0 10px 0;
+      color: #00d9ff;
+      font-size: 14px;
+      text-transform: uppercase;
+    }
+
+    #textInput {
+      width: 100%;
+      min-height: 100px;
+      padding: 12px;
+      font-size: 16px;
+      border: 2px solid #0f3460;
+      border-radius: 8px;
+      background: #0f0f23;
+      color: #fff;
+      font-family: inherit;
+      resize: vertical;
+    }
+    #textInput:focus {
+      outline: none;
+      border-color: #00d9ff;
+    }
+
+    #responseText {
+      font-size: 18px;
+      min-height: 80px;
+      color: #00d9ff;
+      line-height: 1.6;
+    }
+
+    #log {
+      font-family: 'Monaco', 'Consolas', monospace;
+      font-size: 12px;
+      background: #0f0f23;
+      color: #0f0;
+      padding: 10px;
+      border-radius: 8px;
+      max-height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    .metric {
+      background: #0f3460;
+      padding: 10px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .metric .value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #00d9ff;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: #aaa;
+      margin-top: 5px;
+    }
+
+    .example-buttons {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .example-btn {
+      padding: 8px 16px;
+      font-size: 14px;
+      background: #0f3460;
+      color: #fff;
+      border: 1px solid #00d9ff;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .example-btn:hover {
+      background: #00d9ff;
+      color: #000;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎙️ Text-to-Speech Demo</h1>
+  <p>テキストを入力すると、AI が応答を生成して音声で返します。</p>
+
+  <div id="status" class="status disconnected">未接続</div>
+
+  <div class="controls">
+    <button id="connectBtn">接続</button>
+    <button id="disconnectBtn" disabled>切断</button>
+    <button id="sendBtn" disabled>送信</button>
+    <button id="cancelBtn" disabled>キャンセル</button>
+  </div>
+
+  <div class="panel">
+    <h3>📝 入力テキスト</h3>
+    <textarea id="textInput" placeholder="ここにテキストを入力してください...">こんにちは！</textarea>
+    <div class="example-buttons">
+      <button class="example-btn" data-text="こんにちは！">こんにちは</button>
+      <button class="example-btn" data-text="今日の天気はどうですか？">天気を聞く</button>
+      <button class="example-btn" data-text="面白い話を聞かせてください">面白い話</button>
+      <button class="example-btn" data-text="自己紹介してください">自己紹介</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>💬 AI応答</h3>
+    <div id="responseText">ここに応答が表示されます...</div>
+  </div>
+
+  <div class="panel">
+    <h3>📊 メトリクス</h3>
+    <div class="metrics">
+      <div class="metric">
+        <div class="value" id="audioTime">0.0s</div>
+        <div class="label">音声再生時間</div>
+      </div>
+      <div class="metric">
+        <div class="value" id="latency">0ms</div>
+        <div class="label">レイテンシ</div>
+      </div>
+      <div class="metric">
+        <div class="value" id="statusMetric">-</div>
+        <div class="label">ステータス</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>📋 ログ</h3>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    const statusDiv = document.getElementById('status');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const sendBtn = document.getElementById('sendBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
+    const textInput = document.getElementById('textInput');
+    const responseText = document.getElementById('responseText');
+    const logDiv = document.getElementById('log');
+    const audioTimeDiv = document.getElementById('audioTime');
+    const latencyDiv = document.getElementById('latency');
+    const statusMetric = document.getElementById('statusMetric');
+
+    let ws = null;
+    let audioContext = null;
+    let audioQueue = [];
+    let isPlaying = false;
+    let currentSource = null;
+    let requestTime = 0;
+    let firstChunkTime = 0;
+    let totalAudioTime = 0;
+    let pendingQueueSize = 0;  // 保留中のテキスト数
+
+    // 例文ボタン
+    document.querySelectorAll('.example-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        textInput.value = btn.dataset.text;
+      });
+    });
+
+    function log(msg) {
+      const timestamp = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+      logDiv.textContent += `[${timestamp}] ${msg}\n`;
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    function updateStatus(state, text) {
+      statusDiv.className = `status ${state}`;
+      statusDiv.textContent = text;
+      statusMetric.textContent = text;
+    }
+
+    async function initAudio() {
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: 44100
+        });
+        log('AudioContext initialized @ 44.1kHz');
+      }
+    }
+
+    async function playAudioBuffer(pcmData) {
+      if (!audioContext) await initAudio();
+
+      // PCM int16 バイナリを Float32 に変換
+      const int16Array = new Int16Array(pcmData);
+      const float32Array = new Float32Array(int16Array.length);
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768.0;
+      }
+
+      const audioBuffer = audioContext.createBuffer(1, float32Array.length, 44100);
+      audioBuffer.getChannelData(0).set(float32Array);
+
+      audioQueue.push(audioBuffer);
+      if (!isPlaying) {
+        playNextInQueue();
+      }
+    }
+
+    function playNextInQueue() {
+      if (audioQueue.length === 0) {
+        isPlaying = false;
+        updateStatus('connected', '接続中（待機）');
+        return;
+      }
+
+      isPlaying = true;
+      const buffer = audioQueue.shift();
+      
+      currentSource = audioContext.createBufferSource();
+      currentSource.buffer = buffer;
+      currentSource.connect(audioContext.destination);
+      
+      currentSource.onended = () => {
+        playNextInQueue();
+      };
+
+      const duration = buffer.duration;
+      totalAudioTime += duration;
+      audioTimeDiv.textContent = `${totalAudioTime.toFixed(1)}s`;
+
+      currentSource.start();
+      updateStatus('speaking', '再生中');
+    }
+
+    function stopAudio() {
+      if (currentSource) {
+        currentSource.stop();
+        currentSource = null;
+      }
+      audioQueue = [];
+      isPlaying = false;
+    }
+
+    connectBtn.addEventListener('click', async () => {
+      try {
+        await initAudio();
+        
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/tts`;
+        
+        ws = new WebSocket(wsUrl);
+        
+        ws.onopen = () => {
+          log('WebSocket connected');
+          updateStatus('connected', '接続中（待機）');
+          connectBtn.disabled = true;
+          disconnectBtn.disabled = false;
+          sendBtn.disabled = false;
+          
+          // 設定を送信
+          ws.send(JSON.stringify({ type: 'config', mode: 'text-to-speech' }));
+        };
+
+        ws.onclose = () => {
+          log('WebSocket closed');
+          updateStatus('disconnected', '未接続');
+          connectBtn.disabled = false;
+          disconnectBtn.disabled = true;
+          sendBtn.disabled = true;
+          cancelBtn.disabled = true;
+          stopAudio();
+        };
+
+        ws.onerror = (err) => {
+          log(`WebSocket error: ${err}`);
+        };
+
+        ws.onmessage = async (event) => {
+          if (typeof event.data === 'string') {
+            // テキストメッセージ（イベント）
+            try {
+              const msg = JSON.parse(event.data);
+              handleEvent(msg);
+            } catch (e) {
+              log(`JSON parse error: ${e}`);
+            }
+          } else {
+            // バイナリメッセージ（音声）
+            const arrayBuffer = await event.data.arrayBuffer();
+            await playAudioBuffer(arrayBuffer);
+            
+            if (firstChunkTime === 0) {
+              firstChunkTime = Date.now();
+              const latency = firstChunkTime - requestTime;
+              latencyDiv.textContent = `${latency}ms`;
+              log(`First audio chunk latency: ${latency}ms`);
+            }
+          }
+        };
+
+      } catch (error) {
+        log(`Connection error: ${error}`);
+      }
+    });
+
+    disconnectBtn.addEventListener('click', () => {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+    });
+
+    sendBtn.addEventListener('click', () => {
+      const text = textInput.value.trim();
+      if (!text || !ws) return;
+
+      log(`Sending text: "${text}"`);
+      requestTime = Date.now();
+      firstChunkTime = 0;
+      totalAudioTime = 0;
+      responseText.textContent = '';
+      
+      ws.send(JSON.stringify({ type: 'text', text: text }));
+      
+      updateStatus('processing', '処理中');
+      sendBtn.disabled = true;
+      cancelBtn.disabled = false;
+    });
+
+    cancelBtn.addEventListener('click', () => {
+      if (!ws) return;
+      
+      log('Cancelling queued items and current generation');
+      ws.send(JSON.stringify({ type: 'cancel' }));
+      stopAudio();
+      pendingQueueSize = 0;
+      responseText.textContent = '';
+      cancelBtn.disabled = true;
+    });
+
+    // Enterキーで送信（Shift+Enterで改行）
+    textInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (!sendBtn.disabled) {
+          sendBtn.click();
+        }
+      }
+    });
+
+    function handleEvent(msg) {
+      const { name, ...payload } = msg;
+      
+      switch (name) {
+        case 'session_start':
+          log('Session started');
+          break;
+          
+        case 'config_ack':
+          log('Config acknowledged');
+          break;
+          
+        case 'text_queued':
+          log(`Text queued: "${payload.text}" (queue size: ${payload.queue_size})`);
+          pendingQueueSize = payload.queue_size;
+          updateStatus('processing', `待機中... キュー: ${payload.queue_size}`);
+          break;
+          
+        case 'text_received':
+          log(`Text received: "${payload.text}"`);
+          break;
+          
+        case 'llm_start':
+          log(`LLM generating response for: "${payload.user_text}"`);
+          updateStatus('processing', 'AI思考中');
+          break;
+          
+        case 'tts_start':
+          log(`TTS started: "${payload.text}"`);
+          responseText.textContent += payload.text;
+          break;
+          
+        case 'tts_done':
+          log(`TTS done: ${payload.duration_ms}ms @ ${payload.sample_rate}Hz`);
+          break;
+          
+        case 'llm_end':
+          const reason = payload.reason || 'completed';
+          log(`LLM ended: ${reason}`);
+          pendingQueueSize = Math.max(0, pendingQueueSize - 1);
+          
+          if (pendingQueueSize > 0) {
+            updateStatus('processing', `待機中... キュー: ${pendingQueueSize}`);
+          } else {
+            updateStatus('connected', '接続中（待機）');
+          }
+          
+          sendBtn.disabled = false;
+          cancelBtn.disabled = true;
+          break;
+          
+        case 'error':
+          log(`ERROR: ${payload.message}`);
+          updateStatus('connected', 'エラー発生');
+          sendBtn.disabled = false;
+          cancelBtn.disabled = true;
+          break;
+          
+        case 'pong':
+          // ping/pong
+          break;
+          
+        default:
+          log(`Unknown event: ${name}`);
+      }
+    }
+
+    // ページ読み込み時
+    log('Page loaded. Click "接続" to start.');
+  </script>
+</body>
+</html>

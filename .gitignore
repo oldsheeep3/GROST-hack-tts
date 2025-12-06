@@ -3,3 +3,5 @@
 .venv/
 output/
 models/
+
+__pycache__/
